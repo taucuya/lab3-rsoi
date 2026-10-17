@@ -15,9 +15,22 @@ jobs:
         with:
           fetch-depth: 0
 
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+
       - uses: docker/setup-buildx-action@v2
 
-      # TODO build and run unit tests
+      - name: Run unit tests
+        timeout-minutes: 10
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+          pip install -r gateway/requirements.txt
+          pip install -r flight_service/requirements.txt
+          pip install -r ticket_service/requirements.txt
+          pip install -r bonus_service/requirements.txt
+          pytest gateway/tests flight_service/tests ticket_service/tests bonus_service/tests -v
 
       - name: Build images
         timeout-minutes: 10
@@ -31,15 +44,13 @@ jobs:
         env:
           WAIT_PORTS: 8080,8070,8060,8050
 
-      # TODO setup variant, service and port
-
       - name: Run API Tests
-        timeout-minutes: 5
+        timeout-minutes: 10
         run: ./scripts/test-script.sh
         env:
-          VARIANT: <variant>
-          SERVICE_NAME: <your service name>
-          PORT_NUMBER: <port number>
+          VARIANT: v1
+          SERVICE_NAME: bonus_service
+          PORT_NUMBER: 8050
 
       - uses: education/autograding@v1
         id: autograder
@@ -49,7 +60,7 @@ jobs:
         uses: Romanow/google-sheet-autograder-marker@v1.0
         with:
           google_token: ${{secrets.GOOGLE_API_KEY}}
-          sheet_id: "1xkgjUX6Qmk7rdJG-QPOToav-HWWtthJjnShIKnw3oIY"
+          sheet_id: "1xkgjUX6Qmk7rdJG-QPOtoav-HWWtthJjnShIKnw3oIY"
           homework_number: 3
           user_column: 'D'
           column_offset: 'F'
