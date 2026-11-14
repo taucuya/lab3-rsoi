@@ -33,14 +33,13 @@ def test_circuit_breaker_opens_and_recovers():
     breaker = gateway.CircuitBreaker(
         "test",
         window_size=4,
-        minimum_calls=2,
-        failure_rate_threshold=50,
+        minimum_failures=2,
         open_timeout=0.1,
     )
     assert breaker.state() == "closed"
 
     breaker.record_failure()
-    # minimum_calls=2 ещё не набрано — окно не даёт права размыкать цепь
+    # minimum_failures=2 ещё не набрано — окно не даёт права размыкать цепь
     assert breaker.state() == "closed"
 
     breaker.record_failure()
@@ -56,48 +55,108 @@ def test_circuit_breaker_opens_and_recovers():
     assert breaker.allow_request() is True
 
 
-def test_count_based_window_slides():
-    window = gateway.CountBasedSlidingWindow(3)
-    window.add(True)
-    window.add(True)
-    window.add(True)
-    assert window.calls == 3
+def test_failure_window_is_circular():
+    window = gateway.CountBasedSlidingWindow(3, failure_window=60.0)
+    window.add_failure(ts=100.0)
+    window.add_failure(ts=200.0)
+    window.add_failure(ts=300.0)
     assert window.failures == 3
-    assert window.failure_rate == pytest.approx(100.0)
 
-    # успех вытесняет самую старую неудачу из окна
-    window.add(False)
-    assert window.calls == 3
-    assert window.failures == 2
-    assert window.failure_rate == pytest.approx(200.0 / 3.0)
-
-    window.add(False)
-    assert window.calls == 3
-    assert window.failures == 1
-    assert window.failure_rate == pytest.approx(100.0 / 3.0)
+    # четвёртый отказ вытесняет самый старый таймстемп (100.0)
+    window.add_failure(ts=400.0)
+    assert window.failures == 3
+    # остались 200, 300, 400; при now=260 (cutoff=200) свежие все три,
+    # а вытесненный 100.0 в окно уже не попадает
+    assert window.recent_failures(now=260.0) == 3
 
 
-def test_breaker_stays_closed_below_failure_rate():
+def test_recent_failures_counts_only_last_minute():
+    window = gateway.CountBasedSlidingWindow(4, failure_window=60.0)
+    window.add_failure(ts=0.0)
+    window.add_failure(ts=1.0)
+    window.add_failure(ts=1000.0)
+    window.add_failure(ts=1001.0)
+
+    # при now=1000 в пределах минуты (cutoff=940) только 1000 и 1001
+    assert window.failures == 4
+    assert window.recent_failures(now=1000.0) == 2
+    # ровно половина свежих -> True
+    assert window.half_failures_recent(now=1000.0) is True
+
+
+def test_half_failures_recent_false_when_mostly_stale():
+    window = gateway.CountBasedSlidingWindow(4, failure_window=60.0)
+    window.add_failure(ts=0.0)
+    window.add_failure(ts=1.0)
+    window.add_failure(ts=2.0)
+    window.add_failure(ts=1000.0)
+
+    # свежий только один из четырёх
+    assert window.recent_failures(now=1000.0) == 1
+    assert window.half_failures_recent(now=1000.0) is False
+
+
+def test_breaker_stays_closed_below_minimum_failures():
     breaker = gateway.CircuitBreaker(
-        "rate",
+        "min",
         window_size=4,
-        minimum_calls=4,
-        failure_rate_threshold=50,
+        minimum_failures=4,
         open_timeout=10,
     )
     breaker.record_failure()
-    breaker.record_success()
-    breaker.record_success()
-    breaker.record_success()  # 1 отказ из 4 = 25% < 50%
+    breaker.record_failure()
+    breaker.record_failure()  # 3 < 4
     assert breaker.state() == "closed"
+
+
+def test_breaker_stays_closed_when_failures_stale(monkeypatch):
+    clock = {"now": 0.0}
+    monkeypatch.setattr(gateway.time, "time", lambda: clock["now"])
+
+    breaker = gateway.CircuitBreaker(
+        "stale",
+        window_size=4,
+        minimum_failures=3,
+        failure_window=60.0,
+        open_timeout=10.0,
+    )
+    breaker.record_failure()       # ts=0
+    clock["now"] = 61.0
+    breaker.record_failure()       # ts=61
+    clock["now"] = 122.0
+    breaker.record_failure()       # ts=122 (свежий только он)
+
+    # 3 отказа есть, но свежий лишь 1 из 3 -> не размыкаем
+    assert breaker.window.failures == 3
+    assert breaker.window.half_failures_recent() is False
+    assert breaker.state() == "closed"
+
+
+def test_breaker_opens_when_half_failures_recent(monkeypatch):
+    clock = {"now": 0.0}
+    monkeypatch.setattr(gateway.time, "time", lambda: clock["now"])
+
+    breaker = gateway.CircuitBreaker(
+        "recent",
+        window_size=4,
+        minimum_failures=3,
+        failure_window=60.0,
+        open_timeout=10.0,
+    )
+    breaker.record_failure()       # ts=0
+    clock["now"] = 10.0
+    breaker.record_failure()       # ts=10
+    clock["now"] = 20.0
+    breaker.record_failure()       # ts=20
+
+    assert breaker.state() == "open"
 
 
 def test_half_open_failure_reopens():
     breaker = gateway.CircuitBreaker(
         "reopen",
         window_size=2,
-        minimum_calls=2,
-        failure_rate_threshold=50,
+        minimum_failures=2,
         open_timeout=0.05,
     )
     breaker.record_failure()
@@ -116,18 +175,16 @@ def test_metrics_reflect_window():
     breaker = gateway.CircuitBreaker(
         "metrics",
         window_size=4,
-        minimum_calls=4,
-        failure_rate_threshold=50,
+        minimum_failures=4,
         open_timeout=10,
     )
     breaker.record_failure()
-    breaker.record_success()
+    breaker.record_failure()
 
     metrics = breaker.metrics()
     assert metrics["state"] == "closed"
-    assert metrics["calls"] == 2
-    assert metrics["failures"] == 1
-    assert metrics["failureRate"] == pytest.approx(50.0)
+    assert metrics["failures"] == 2
+    assert metrics["recentFailures"] == 2
 
 
 def test_privilege_returns_503_when_bonus_unavailable(monkeypatch):

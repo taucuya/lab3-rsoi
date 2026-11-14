@@ -1,5 +1,3 @@
-from collections import deque
-
 from flask import Flask, request, jsonify
 import requests
 import uuid
@@ -18,8 +16,8 @@ BONUS_SERVICE = os.getenv("BONUS_SERVICE_URL", "http://bonus_service:8050")
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "5"))
 
 CB_WINDOW_SIZE = int(os.getenv("CB_WINDOW_SIZE", "10"))
-CB_MINIMUM_CALLS = int(os.getenv("CB_MINIMUM_CALLS", "5"))
-CB_FAILURE_RATE_THRESHOLD = float(os.getenv("CB_FAILURE_RATE_THRESHOLD", "50"))
+CB_MINIMUM_FAILURES = int(os.getenv("CB_MINIMUM_FAILURES", "5"))
+CB_FAILURE_WINDOW = float(os.getenv("CB_FAILURE_WINDOW", "60"))
 CB_OPEN_TIMEOUT = float(os.getenv("CB_OPEN_TIMEOUT", "1"))
 QUEUE_RETRY_INTERVAL = float(os.getenv("QUEUE_RETRY_INTERVAL", "0.5"))
 
@@ -27,31 +25,37 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 
 class CountBasedSlidingWindow:
-    def __init__(self, size):
+    def __init__(self, size, failure_window=60.0):
         if size <= 0:
             raise ValueError("window size must be positive")
         self.size = size
-        self._results = deque(maxlen=size)
+        self.failure_window = failure_window
+        self._timestamps = [None] * size
+        self._index = 0
+        self._count = 0
 
-    def add(self, failed):
-        self._results.append(bool(failed))
+    def add_failure(self, ts=None):
+        self._timestamps[self._index] = time.time() if ts is None else ts
+        self._index = (self._index + 1) % self.size
+        if self._count < self.size:
+            self._count += 1
 
     def clear(self):
-        self._results.clear()
-
-    @property
-    def calls(self):
-        return len(self._results)
+        self._timestamps = [None] * self.size
+        self._index = 0
+        self._count = 0
 
     @property
     def failures(self):
-        return sum(self._results)
+        return self._count
 
-    @property
-    def failure_rate(self):
-        if not self._results:
-            return 0.0
-        return 100.0 * self.failures / len(self._results)
+    def recent_failures(self, now=None):
+        now = time.time() if now is None else now
+        cutoff = now - self.failure_window
+        return sum(1 for ts in self._timestamps if ts is not None and ts >= cutoff)
+
+    def half_failures_recent(self, now=None):
+        return self._count > 0 and self.recent_failures(now) * 2 >= self._count
 
 
 class CircuitBreaker:
@@ -59,20 +63,19 @@ class CircuitBreaker:
         self,
         name,
         window_size=10,
-        minimum_calls=None,
-        failure_rate_threshold=50.0,
+        minimum_failures=None,
+        failure_window=60.0,
         open_timeout=2.0,
     ):
         self.name = name
         self.window_size = window_size
-        self.minimum_calls = min(
-            minimum_calls if minimum_calls is not None else window_size,
+        self.minimum_failures = min(
+            minimum_failures if minimum_failures is not None else window_size,
             window_size,
         )
-        self.failure_rate_threshold = failure_rate_threshold
         self.open_timeout = open_timeout
         self.opened_at = None
-        self.window = CountBasedSlidingWindow(window_size)
+        self.window = CountBasedSlidingWindow(window_size, failure_window)
         self.lock = threading.Lock()
 
     def _state(self):
@@ -92,10 +95,7 @@ class CircuitBreaker:
 
     def record_success(self):
         with self.lock:
-            state = self._state()
-            if state == "closed":
-                self.window.add(failed=False)
-            elif state == "half-open":
+            if self._state() == "half-open":
                 self.opened_at = None
                 self.window.clear()
 
@@ -107,20 +107,22 @@ class CircuitBreaker:
             if state == "half-open":
                 self.opened_at = time.time()
                 return
-            self.window.add(failed=True)
-            if (
-                self.window.calls >= self.minimum_calls
-                and self.window.failure_rate >= self.failure_rate_threshold
-            ):
+            self.window.add_failure()
+            if self._should_open():
                 self.opened_at = time.time()
+
+    def _should_open(self):
+        return (
+            self.window.failures >= self.minimum_failures
+            and self.window.half_failures_recent()
+        )
 
     def metrics(self):
         with self.lock:
             return {
                 "state": self._state(),
-                "calls": self.window.calls,
                 "failures": self.window.failures,
-                "failureRate": round(self.window.failure_rate, 2),
+                "recentFailures": self.window.recent_failures(),
             }
 
 
@@ -135,8 +137,8 @@ def get_breaker(key):
             breaker = CircuitBreaker(
                 key,
                 window_size=CB_WINDOW_SIZE,
-                minimum_calls=CB_MINIMUM_CALLS,
-                failure_rate_threshold=CB_FAILURE_RATE_THRESHOLD,
+                minimum_failures=CB_MINIMUM_FAILURES,
+                failure_window=CB_FAILURE_WINDOW,
                 open_timeout=CB_OPEN_TIMEOUT,
             )
             _breakers[key] = breaker
